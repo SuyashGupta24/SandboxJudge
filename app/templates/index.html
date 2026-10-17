@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SandboxJudge</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    textarea.code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; min-height: 340px; tab-size: 4; white-space: pre; }
+    pre.out { background: var(--bs-tertiary-bg); border-radius: .375rem; padding: .75rem; max-height: 220px; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word; }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <h1 class="h3 mb-1">SandboxJudge</h1>
+  <p class="text-secondary">Submit code; it runs in an isolated Docker sandbox (no network, read-only filesystem, cgroup limits).</p>
+
+  <div class="row g-4">
+    <div class="col-lg-7">
+      <div class="row g-2 mb-2">
+        <div class="col-sm-4">
+          <label class="form-label" for="language">Language</label>
+          <select id="language" class="form-select">
+            <option value="python">Python 3</option>
+            <option value="cpp">C++ (GCC)</option>
+            <option value="java">Java (class Solution)</option>
+          </select>
+        </div>
+        <div class="col-sm-8">
+          <label class="form-label" for="problem">Problem</label>
+          <select id="problem" class="form-select">
+            <option value="">Custom input (stdin)</option>
+          </select>
+        </div>
+      </div>
+
+      <textarea id="code" class="form-control code mb-2" spellcheck="false"></textarea>
+
+      <div id="stdinBox" class="mb-2">
+        <label class="form-label" for="stdin">Custom stdin</label>
+        <textarea id="stdin" class="form-control code" style="min-height:80px" spellcheck="false">2 3</textarea>
+      </div>
+
+      <button id="submitBtn" class="btn btn-primary">Submit</button>
+      <span id="msg" class="ms-3 text-secondary"></span>
+    </div>
+
+    <div class="col-lg-5">
+      <div id="problemCard" class="card mb-3 d-none">
+        <div class="card-body">
+          <h2 class="h6" id="pTitle"></h2>
+          <p class="small mb-1" id="pDesc" style="white-space:pre-wrap"></p>
+          <div class="small text-secondary" id="pLimits"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex align-items-center justify-content-between mb-2">
+            <h2 class="h6 mb-0">Result</h2>
+            <span id="badge" class="badge text-bg-secondary">idle</span>
+          </div>
+          <div class="small text-secondary mb-2" id="metrics">-</div>
+          <div class="small text-secondary">stdout</div>
+          <pre class="out mb-2" id="stdout"></pre>
+          <div class="small text-secondary">stderr</div>
+          <pre class="out" id="stderr"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% raw %}
+<script>
+const TEMPLATES = {
+  python: "a, b = map(int, input().split())\nprint(a + b)\n",
+  cpp: "#include <iostream>\nint main() {\n    long long a, b;\n    std::cin >> a >> b;\n    std::cout << a + b << \"\\n\";\n}\n",
+  java: "import java.util.*;\n\npublic class Solution {\n    public static void main(String[] args) {\n        Scanner s = new Scanner(System.in);\n        System.out.println(s.nextInt() + s.nextInt());\n    }\n}\n",
+};
+const TERMINAL = new Set(["ACCEPTED", "WRONG_ANSWER", "TLE", "MLE", "COMPILATION_ERROR", "RUNTIME_ERROR", "INTERNAL_ERROR"]);
+const COLORS = { PENDING: "secondary", RUNNING: "info", ACCEPTED: "success", WRONG_ANSWER: "danger", TLE: "warning",
+                 MLE: "warning", COMPILATION_ERROR: "danger", RUNTIME_ERROR: "danger", INTERNAL_ERROR: "dark" };
+
+const $ = (id) => document.getElementById(id);
+let pollTimer = null;
+
+function setBadge(status) {
+  $("badge").textContent = status;
+  $("badge").className = "badge text-bg-" + (COLORS[status] || "secondary");
+}
+
+function loadTemplate() { $("code").value = TEMPLATES[$("language").value]; }
+$("language").addEventListener("change", loadTemplate);
+loadTemplate();
+
+// Tab key inserts spaces instead of leaving the editor.
+$("code").addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  e.preventDefault();
+  const t = e.target, s = t.selectionStart;
+  t.value = t.value.slice(0, s) + "    " + t.value.slice(t.selectionEnd);
+  t.selectionStart = t.selectionEnd = s + 4;
+});
+
+async function loadProblems() {
+  try {
+    const list = await (await fetch("/api/v1/problems")).json();
+    for (const p of list) {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = `#${p.id} ${p.title}`;
+      $("problem").appendChild(o);
+    }
+  } catch (_) { /* UI still works for custom stdin */ }
+}
+
+$("problem").addEventListener("change", async () => {
+  const id = $("problem").value;
+  $("stdinBox").classList.toggle("d-none", id !== "");
+  $("problemCard").classList.toggle("d-none", id === "");
+  if (!id) return;
+  const p = await (await fetch("/api/v1/problems/" + id)).json();
+  $("pTitle").textContent = p.title;
+  $("pDesc").textContent = p.description + (p.sample ? `\n\nSample input:\n${p.sample.input}\nSample output:\n${p.sample.expected_output}` : "");
+  $("pLimits").textContent = `Time limit ${p.time_limit_ms} ms, memory limit ${Math.round(p.memory_limit_kb / 1024)} MB, ${p.total_testcases} test cases`;
+});
+
+function render(s) {
+  setBadge(s.status);
+  const t = s.execution_time_ms == null ? "-" : s.execution_time_ms + " ms";
+  const m = s.memory_used_kb == null ? "-" : s.memory_used_kb + " KB";
+  $("metrics").textContent = `time ${t} | memory ${m} | passed ${s.passed_testcases}/${s.total_testcases}`;
+  $("stdout").textContent = s.stdout || "";
+  $("stderr").textContent = s.stderr || "";
+}
+
+async function poll(id, startedAt) {
+  try {
+    const res = await fetch("/api/v1/status/" + id);
+    if (res.status === 429) { pollTimer = setTimeout(() => poll(id, startedAt), 3000); return; }
+    const s = await res.json();
+    render(s);
+    if (TERMINAL.has(s.status)) { $("submitBtn").disabled = false; $("msg").textContent = ""; return; }
+  } catch (_) { /* transient network error: keep polling */ }
+  if (Date.now() - startedAt > 120000) { $("submitBtn").disabled = false; $("msg").textContent = "Timed out waiting for result."; return; }
+  pollTimer = setTimeout(() => poll(id, startedAt), 700);
+}
+
+$("submitBtn").addEventListener("click", async () => {
+  clearTimeout(pollTimer);
+  const pid = $("problem").value;
+  const body = { language: $("language").value, source_code: $("code").value };
+  if (pid) body.problem_id = Number(pid); else body.stdin = $("stdin").value;
+
+  $("submitBtn").disabled = true;
+  $("msg").textContent = "Submitting...";
+  $("stdout").textContent = ""; $("stderr").textContent = ""; $("metrics").textContent = "-";
+  setBadge("PENDING");
+
+  const res = await fetch("/api/v1/submit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (res.status !== 202) {
+    $("msg").textContent = data.error || ("Error " + res.status);
+    $("submitBtn").disabled = false;
+    setBadge("idle");
+    return;
+  }
+  $("msg").textContent = "Queued: " + data.submission_id.slice(0, 8);
+  poll(data.submission_id, Date.now());
+});
+
+loadProblems();
+</script>
+{% endraw %}
+</body>
+</html>
